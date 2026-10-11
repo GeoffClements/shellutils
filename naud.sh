@@ -2,7 +2,7 @@
 
 ###################################################################
 # naud - Normalize mp3, ogg and flac files
-# (c) Copyright - 2013 Geoff Clements
+# (c) Copyright - 2026 Geoff Clements
 #
 # This program is free software; you can redistribute it and/or
 # modify it under the terms of the GNU General Public License
@@ -21,8 +21,8 @@
 
 ###################################################################
 # Two useful web pages about quality settings
-# http://lame.cvs.sourceforge.net/viewvc/lame/lame/doc/html/usage.html
-# http://www.vorbis.com/faq/#quality
+# https://sourceforge.net/p/lame/svn/HEAD/tree/trunk/lame/USAGE
+# https://xiph.org/vorbis/faq/#quality
 ###################################################################
 
 ###################################################################
@@ -33,678 +33,592 @@ LAME_DEF_QUAL="-V 0"
 OGG_DEF_QUAL="-q 6"
 
 ###################################################################
-# O traveller stray not beyond this point - here be dragons!
+# Everything from this point should not be changed unless you
+# know what you're doing
 ###################################################################
+
+if ((BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 3))); then
+  echo "${0##*/}: bash 4.3 or later is required" >&2
+  exit 1
+fi
 
 shopt -u nullglob
 
-# Set up temporary directory
-TMPDIR=${TMP:-/tmp}
-WDIRS=() # Cache of all temp dirs, used for cleanup
-trap "{ cleanup ; exit 255 ;}" INT TERM
-trap "{ cleanup ; exit 0 ;}" EXIT
-
-TARGET=same # keep encoded files the same type as the decoded ones
-TARGET_OPTS="same ogg vorbis mp3 flac"
+PROG=${0##*/}
+TARGET=same                          # same | mp3 | vorbis | flac
+TMPBASE=${TMPDIR:-${TMP:-/tmp}}      # where the working area is created
+MAXJOBS=                             # parallel jobs, set below
+RECURSE=0                            # -r: descend into sub-directories
+INNER_PAR=0                          # 1 = fan out inside a directory batch
+FAILS=0                              # number of things that went wrong
+SESSION=                             # our private temp dir
+declare -A NORM_OPTS=()              # options passed through to normalize
 
 #########################################
-# Cleanup functions
+# Small helpers
 #########################################
-cleanup () {
-  for tdir in "${WDIRS[@]}"
-  do
-    rm -r "${tdir}" 2>/dev/null
-  done
-  job_pool_shutdown
+log ()  { printf '%s\n' "$*"; }
+warn () { printf '%s: %s\n' "$PROG" "$*" >&2; }
+die ()  { warn "$*"; exit 1; }
+
+usage () {
+  cat <<EOF
+Usage: $PROG [OPTIONS] FILE|DIR ...
+
+Normalize the volume of mp3, ogg and flac files.  A directory is normalized
+as one batch (one gain for the whole album, so relative levels survive);
+files named individually are normalized on their own.
+
+Files are re-encoded in place.  Each new file is written to a temporary name
+first and only replaces the original once encoding has succeeded.
+
+Options apply to the files and directories that follow them:
+  -o TYPE   output type: same (default), mp3, ogg (or vorbis), flac
+  -r        recurse into sub-directories, one batch per directory
+  -a AMP    \\
+  -g ADJ     |
+  -T THR     |  passed to normalize-audio, see "normalize-audio --help".
+  -n -b -m   |  Add a trailing "-" to cancel an earlier one, e.g. "-g-".
+  -v -q     /
+
+Global options:
+  -t DIR    directory for temporary files (default: \$TMPDIR, or /tmp)
+  -j N      maximum number of parallel jobs (default: number of CPUs)
+  -h        show this help
+
+Encoder settings for flac sources are at the top of this script.
+EOF
 }
 
-die () {
-  echo "$1"
-  cleanup
-  exit 1
-}
+#########################################
+# Early option scan: -h and -t are global
+#########################################
+args=("$@")
+for ((i = 0; i < ${#args[@]}; i++)); do
+  case ${args[i]} in
+    -h|--help) usage; exit 0 ;;
+    -t)
+      ((i + 1 < ${#args[@]})) || die "Missing argument to -t"
+      TMPBASE=${args[i + 1]}
+      ((i++))
+      ;;
+  esac
+done
+((${#args[@]})) || { usage >&2; exit 1; }
 
 #########################################
 # Find programs which we need
-# Can't do without these
 #########################################
-SOX=$(which sox) || die "Cannot find sox"
+SOX=$(command -v sox)  || die "Cannot find sox"
+SOXI=$(command -v soxi) || die "Cannot find soxi"
+NORM=$(command -v normalize-audio || command -v normalize) \
+  || die "Cannot find normalize-audio"
+command -v awk >/dev/null || die "Cannot find awk"
 
-SOXI=$(which soxi) || die "Cannot find soxi"
+# Encoders are only needed if we actually encode to that format, so a
+# missing one is reported per file rather than stopping everything.
+LAME=$(command -v lame)
+OGGENC=$(command -v oggenc)
+FLAC=$(command -v flac)
 
-NORM=$(which normalize-audio) || \
-NORM=$(which normalize) || die "Cannot find normalize-audio"
-
-LAME=$(which lame) || die "Cannot find lame"
-
-OGGENC=$(which oggenc) || die "Cannot find oggenc"
-
-FLAC=$(which flac) || die "Cannot find flac"
-
-numprocs=$(nproc 2>/dev/null)
-if [ ${#numprocs} -eq 0 ]
-then
-  numprocs=$(grep -c "^core id" /proc/cpuinfo)
-fi
+MAXJOBS=$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)
 
 #########################################
-# Job Pool
-# Copyright (c) 2012 Vince Tse
-# with changes by Geoff Clements
+# Working area and cleanup
 #########################################
-# end-of-jobs marker
-job_pool_end_of_jobs="JOBPOOL_END_OF_JOBS"
+[ -d "${TMPBASE}" ] || die "Temporary directory ${TMPBASE} does not exist"
+SESSION=$(mktemp -d "${TMPBASE%/}/naud-XXXXXXXXXX") \
+  || die "Cannot create a temporary directory in ${TMPBASE}"
 
-# job queue used to send jobs to the workers
-job_pool_job_queue=/tmp/job_pool_job_queue_$$
-
-# where to run results to
-job_pool_result_log=/tmp/job_pool_result_log_$$
-
-# toggle command echoing
-job_pool_echo_command=0
-
-# number of parallel jobs allowed.  also used to determine if job_pool_init
-# has been called when jobs are queued.
-job_pool_pool_size=-1
-
-# \brief variable to check for number of non-zero exits
-job_pool_nerrors=0
-
-################################################################################
-# private functions
-################################################################################
-
-# \brief debug output
-function _job_pool_echo()
-{
-    if [[ "${job_pool_echo_command}" == "1" ]]; then
-        echo $@
-    fi
+cleanup () {
+  [[ -n ${SESSION} ]] && rm -rf -- "${SESSION}"
 }
 
-# \brief cleans up
-function _job_pool_cleanup()
-{
-    rm -f ${job_pool_job_queue} ${job_pool_result_log}
+on_signal () {
+  trap - INT TERM
+  # shellcheck disable=SC2046
+  kill $(jobs -p) 2>/dev/null
+  wait 2>/dev/null
+  exit "$1"
 }
 
-# \brief signal handler
-function _job_pool_exit_handler()
-{
-    _job_pool_stop_workers
-    _job_pool_cleanup
-}
+trap cleanup EXIT
+trap 'on_signal 130' INT
+trap 'on_signal 143' TERM
 
-# \brief print the exit codes for each command
-# \param[in] result_log  the file where the exit codes are written to
-function _job_pool_print_result_log()
-{
-    job_pool_nerrors=$(grep ^ERROR "${job_pool_result_log}" | wc -l)
-    cat "${job_pool_result_log}" | sed -e 's/^ERROR//'
-}
-
-# \brief the worker function that is called when we fork off worker processes
-# \param[in] id  the worker ID
-# \param[in] job_queue  the fifo to read jobs from
-# \param[in] result_log  the temporary log file to write exit codes to
-function _job_pool_worker()
-{
-    local id=$1
-    local job_queue=$2
-    local result_log=$3
-    local cmd=
-    local args=
-
-    exec 7<> ${job_queue}
-    while [[ "${cmd}" != "${job_pool_end_of_jobs}" && -e "${job_queue}" ]]; do
-        # workers block on the exclusive lock to read the job queue
-        flock --exclusive 7
-        IFS=$'\v'
-        read cmd args <${job_queue}
-        set -- ${args}
-        unset IFS
-        flock --unlock 7
-        # the worker should exit if it sees the end-of-job marker or run the
-        # job otherwise and save its exit code to the result log.
-        if [[ "${cmd}" == "${job_pool_end_of_jobs}" ]]; then
-            # write it one more time for the next sibling so that everyone
-            # will know we are exiting.
-            echo "${cmd}" >&7
-        else
-            _job_pool_echo "### _job_pool_worker-${id}: ${cmd}"
-            # run the job
-            { ${cmd} "$@" ; }
-            # now check the exit code and prepend "ERROR" to the result log entry
-            # which we will use to count errors and then strip out later.
-            local result=$?
-            local status=
-            if [[ "${result}" != "0" ]]; then
-                status=ERROR
-            fi
-            # now write the error to the log, making sure multiple processes
-            # don't trample over each other.
-            exec 8<> ${result_log}
-            flock --exclusive 8
-            _job_pool_echo "${status}job_pool: exited ${result}: ${cmd} $@" >> ${result_log}
-            flock --unlock 8
-            exec 8>&-
-            _job_pool_echo "### _job_pool_worker-${id}: exited ${result}: ${cmd} $@"
-        fi
-    done
-    exec 7>&-
-}
-
-# \brief sends message to worker processes to stop
-function _job_pool_stop_workers()
-{
-    # send message to workers to exit, and wait for them to stop before
-    # doing cleanup.
-    echo ${job_pool_end_of_jobs} >> ${job_pool_job_queue}
-    wait
-}
-
-# \brief fork off the workers
-# \param[in] job_queue  the fifo used to send jobs to the workers
-# \param[in] result_log  the temporary log file to write exit codes to
-function _job_pool_start_workers()
-{
-    local job_queue=$1
-    local result_log=$2
-    for ((i=0; i<${job_pool_pool_size}; i++)); do
-        _job_pool_worker ${i} ${job_queue} ${result_log} &
-    done
-}
-
-################################################################################
-# public functions
-################################################################################
-
-# \brief initializes the job pool
-# \param[in] pool_size  number of parallel jobs allowed
-# \param[in] echo_command  1 to turn on echo, 0 to turn off
-function job_pool_init()
-{
-    local pool_size=$1
-    local echo_command=$2
-
-    # set the global attibutes
-    job_pool_pool_size=${pool_size:=1}
-    job_pool_echo_command=${echo_command:=0}
-
-    # create the fifo job queue and create the exit code log
-    rm -rf ${job_pool_job_queue} ${job_pool_result_log}
-    mkfifo ${job_pool_job_queue}
-    touch ${job_pool_result_log}
-
-    # fork off the workers
-    _job_pool_start_workers ${job_pool_job_queue} ${job_pool_result_log}
-}
-
-# \brief waits for all queued up jobs to complete and shuts down the job pool
-function job_pool_shutdown()
-{
-    _job_pool_stop_workers
-    _job_pool_print_result_log
-    _job_pool_cleanup
-}
-
-# \brief run a job in the job pool
-function job_pool_run()
-{
-    if [[ "${job_pool_pool_size}" == "-1" ]]; then
-        job_pool_init
-    fi
-    printf "%s\v" "$@" >> ${job_pool_job_queue}
-    echo >> ${job_pool_job_queue}
-}
-
-# \brief waits for all queued up jobs to complete before starting new jobs
-# This function actually fakes a wait by telling the workers to exit
-# when done with the jobs and then restarting them.
-function job_pool_wait()
-{
-    _job_pool_stop_workers
-    _job_pool_start_workers ${job_pool_job_queue} ${job_pool_result_log}
-}
 #########################################
-# End of Job Pool
+# Parallel job control
+#
+# Jobs are plain background processes, throttled to MAXJOBS.  This
+# replaces the fifo/flock job pool, and also bounds the work done
+# inside a directory (the old code started one encoder per file with
+# no limit).
 #########################################
+reap_one () {
+  local rc
+  wait -n
+  rc=$?
+  ((rc == 127)) && return 1        # nothing left to wait for
+  ((rc != 0)) && FAILS=$((FAILS + 1))
+  return 0
+}
 
-identify_file () {
-  # Return array of audio parameters for the passed file: file_data
-  # $1 = path to file
-  #
-  # The array of file data that is generated looks like this
-  # 0 = path to input file
-  # 1 = input file encoding
-  # 2 = bit rate (bits per second)
-  # 3 = number of channels
-  # 4 = title
-  # 5 = artist
-  # 6 = album
-  # 7 = date or year
-  # 8 = track number
-  # 9 = genre
-  # 10 = comment
-  
-  # First save file name
-  local file_data=("${1}") #0
-  
-  # Ignore .m3u files as soxi obligingly decodes them - the b*****d
-  if echo "${1}" | grep -qv -e ".m3u$"
-  then
-    # Then get type, bitrate and channels
-    if file_data+=($(${SOXI} -t "${1}" 2>/dev/null)) #1
-    then
-      file_data+=($(${SOXI} -B "${1}")) #2
-      file_data+=($(${SOXI} -c "${1}")) #3
-		      
-      # Now get id tags
-      local tags=$(${SOXI} -a "${1}")
-      file_data+=("$(echo "${tags}" | grep -i '^title=' | cut -d = -f 2)") #4
-      file_data+=("$(echo "${tags}" | grep -i '^artist=' | cut -d = -f 2)") #5
-      file_data+=("$(echo "${tags}" | grep -i '^album=' | cut -d = -f 2)") #6
-      file_data+=("$(echo "${tags}" | grep -iE '^date=|^year=' | cut -d = -f 2)") #7
-      file_data+=("$(echo "${tags}" | grep -i '^tracknumber=' | cut -d = -f 2)") #8
-      file_data+=("$(echo "${tags}" | grep -i '^genre=' | cut -d = -f 2)") #9
-      file_data+=("$(echo "${tags}" | grep -i '^comment=' | cut -d = -f 2)") #10
-    fi
+drain () {
+  while reap_one; do :; done
+}
+
+throttle () {
+  while (($(jobs -rp | wc -l) >= MAXJOBS)); do
+    reap_one || break
+  done
+}
+
+# run_job CMD ARGS... - background when fanning out, inline otherwise
+run_job () {
+  if ((INNER_PAR)); then
+    throttle
+    "$@" &
+  else
+    "$@" || FAILS=$((FAILS + 1))
   fi
-  
-  # Fix bitrate to be a true number
-  local val
-  if [ ${#file_data[2]} -gt 0 ]
-  then
-    case ${file_data[2]: -1} in
-      k)
-	val=$(echo "${file_data[2]::${#file_data[2]}-1} * 1000" | bc)
-	file_data[2]=$(printf "%.0f" ${val})
-	;;
-      M)
-	val=$(echo "${file_data[2]::${#file_data[2]}-1} * 1000000" | bc)
-	file_data[2]=$(printf "%.0f" ${val})
-	;;
+}
+
+#########################################
+# Audio helpers
+#########################################
+probe_file () {
+  # Identify an audio file.
+  # $1 = path to file
+  # $2 = file to receive the file's tags, one KEY=VALUE per line
+  # Prints three lines: type, bitrate in bits per second (0 if unknown)
+  # and number of channels.  Fails if this isn't an mp3, vorbis or flac.
+  local type br ch
+  type=$("${SOXI}" -t "$1" 2>/dev/null) || return 1
+  case ${type} in
+    mp3|vorbis|flac) ;;
+    *) return 1 ;;
+  esac
+  br=$("${SOXI}" -B "$1" 2>/dev/null)
+  ch=$("${SOXI}" -c "$1" 2>/dev/null) || return 1
+  "${SOXI}" -a "$1" >"$2" 2>/dev/null
+
+  printf '%s\n' "${type}"
+  # soxi reports e.g. "128k" or "1.02M"
+  awk -v v="${br}" 'BEGIN {
+    n = v + 0
+    if (v ~ /[kK]$/) n *= 1000
+    else if (v ~ /[mM]$/) n *= 1000000
+    printf "%d\n", n + 0.5
+  }'
+  printf '%s\n' "${ch}"
+}
+
+out_type_for () {
+  # $1 = type of the source file
+  if [[ ${TARGET} == same ]]; then
+    printf '%s\n' "$1"
+  else
+    printf '%s\n' "${TARGET}"
+  fi
+}
+
+encoder_for () {
+  # $1 = output type; prints the path of its encoder (empty if missing)
+  case $1 in
+    mp3)    printf '%s\n' "${LAME}" ;;
+    vorbis) printf '%s\n' "${OGGENC}" ;;
+    flac)   printf '%s\n' "${FLAC}" ;;
+  esac
+}
+
+dest_path () {
+  # Work out where the encoded file goes.  Same type: replace the
+  # original.  Different type: same name with the new extension.
+  # $1 = source path, $2 = source type, $3 = output type
+  local dir name ext
+  if [[ $2 == "$3" ]]; then
+    printf '%s\n' "$1"
+    return
+  fi
+  dir=${1%/*}
+  [[ ${dir} == "$1" ]] && dir=.
+  name=${1##*/}
+  case $3 in
+    vorbis) ext=ogg ;;
+    *)      ext=$3 ;;
+  esac
+  printf '%s/%s.%s\n' "${dir}" "${name%.*}" "${ext}"
+}
+
+clamp_number () {
+  # clamp_number VALUE MIN MAX - print VALUE limited to MIN..MAX
+  awk -v v="$1" -v lo="$2" -v hi="$3" \
+    'BEGIN { if (v < lo) v = lo; if (v > hi) v = hi; printf "%.2f\n", v }'
+}
+
+build_tags () {
+  # Turn the saved tags into encoder arguments, filling the caller's
+  # "tagargs" array.  All Vorbis comments are carried across for ogg and
+  # flac; lame can only take the ones we can map to ID3 frames.
+  # Tags that would be wrong after normalizing (ReplayGain) are dropped.
+  # $1 = tag file, $2 = output type
+  local line key val
+  tagargs=()
+  [[ -r $1 ]] || return 0
+  while IFS= read -r line || [[ -n ${line} ]]; do
+    [[ ${line} == *=* ]] || continue
+    key=${line%%=*}
+    val=${line#*=}                 # keep any further "=" in the value
+    [[ -n ${val} ]] || continue
+    key=${key^^}
+    [[ ${key} =~ ^[A-Z0-9_]+$ ]] || continue
+    case ${key} in
+      REPLAYGAIN_*|R128_*|ENCODER|WAVEFORMATEXTENSIBLE_CHANNEL_MASK) continue ;;
+      METADATA_BLOCK_PICTURE|COVERART*) continue ;;
+      YEAR) key=DATE ;;
     esac
-  fi
-  
-  #echo "${file_data[@]}"
-  echo $(declare -p file_data)
+    case $2 in
+      mp3)
+        case ${key} in
+          TITLE)       tagargs+=(--tt "${val}") ;;
+          ARTIST)      tagargs+=(--ta "${val}") ;;
+          ALBUM)       tagargs+=(--tl "${val}") ;;
+          DATE)        tagargs+=(--ty "${val}") ;;
+          TRACKNUMBER) tagargs+=(--tn "${val}") ;;
+          GENRE)       tagargs+=(--tg "${val}") ;;
+          COMMENT)     tagargs+=(--tc "${val}") ;;
+          ALBUMARTIST) tagargs+=(--tv "TPE2=${val}") ;;
+          DISCNUMBER)  tagargs+=(--tv "TPOS=${val}") ;;
+          COMPOSER)    tagargs+=(--tv "TCOM=${val}") ;;
+        esac
+        ;;
+      vorbis) tagargs+=(-c "${key}=${val}") ;;
+      flac)   tagargs+=(-T "${key}=${val}") ;;
+    esac
+  done <"$1"
 }
 
-make_decode_name () {
-  # Calculate the name of the decode file
-  # $1 = full path of audio file
-  # $2 = full path of temp directory
-  
-  local fromfile=${1##*/}
-  echo "${2}/${fromfile%.*}".wav
-}
-
-decode_file () {
-  # Convert the file to a wav, there's nothing more to see
-  # here, move along now!
-  # $1 = path of file to decode
-  
-  echo "Decoding $1 ..."
-  ${SOX} "${1}" -t wav "${2}" 2>/dev/null
-  return $?
-}
-
-change_ext () {
-  # Change a file's extension. If we think it should be
-  # vorbis then make it ogg, after all who uses vorbis?
-  # $1 = path to file
-  # $2 = new extension to append
-  
-  local new_ext
-  if [ "${2}" == "vorbis" ]
-  then
-    new_ext="ogg"
+#########################################
+# Decode / encode one file
+#
+# These two read the per-file arrays (SRC, TYPE, CH, BR, WAV) and WORK
+# from process_group, and always run in a subshell, so the traps they
+# set can't leak into the main shell.
+#########################################
+decode_one () {
+  # $1 = index of file
+  local i=$1 err
+  log "Decoding ${SRC[i]} ..."
+  if err=$("${SOX}" "${SRC[i]}" -t wav "${WAV[i]}" 2>&1); then
+    : >"${WORK}/${i}.ok"
   else
-    new_ext="${2}"
+    warn "Failed to decode ${SRC[i]}: ${err}"
+    return 1
   fi
-  
-  echo "${1%.*}.${new_ext}"
 }
 
-encode_file () {
-  # Encode a wav file to either mp3, ogg or flac
-  # $1 = array holding all file data, see earlier comments
-  # for contents
-  
-  local file_data=("$@") quality out_type
-  
-  # Check to see if we're going to change the file type
-  # when we encode.
-  if [ "${file_data[11]}" == "same" ]
-  then
-    out_type=${file_data[1]}
-  else
-    out_type=${file_data[11]}
-  fi
-  
-  # If we are changing the file type then we need to change
-  # the extension of the output file
-  if [ "${out_type}" != "${file_data[1]}" ]
-  then
-    file_data[0]="$(change_ext "${file_data[0]}" "${file_data[11]}")"
-  fi
-  
-  # Choose your weapons gentlemen
+encode_one () {
+  # $1 = index of file
+  local i=$1
+  local src=${SRC[i]} in_type=${TYPE[i]} wav=${WAV[i]} br=${BR[i]}
+  local out_type dest dir tmp mode err
+  local -a quality=() mono=() tagargs=() cmd=()
+
+  out_type=$(out_type_for "${in_type}")
+  dest=$(dest_path "${src}" "${in_type}" "${out_type}")
+  dir=${dest%/*}
+  [[ ${dir} == "${dest}" ]] && dir=.
+
+  # Never write straight over the original: encode to a temporary file
+  # next to the destination and rename it into place on success.
+  tmp=$(mktemp "${dir}/.naud-XXXXXXXX") || { warn "Cannot write to ${dir}"; return 1; }
+  # shellcheck disable=SC2064
+  trap "rm -f -- '${tmp}'" EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+
+  build_tags "${WORK}/${i}.tags" "${out_type}"
+  log "Encoding ${src##*/} to ${out_type} ..."
+
   case ${out_type} in
-    "mp3")
-      echo Encoding $(basename "${file_data[@]: -1}") to mp3 ...
-
-      # set the mono switch if needed
-      [ "${file_data[3]}" -eq 1 ] && local mode="-m m"
-      
-      # Work out quality
-      # Beware nasty magic numbers ahead divined by sacrificing virgins,
-      # playing with the entrails and reading the web pages shown
-      # near the top of this file
-      if [ "${file_data[1]}" == "flac" ]
-      then
-	quality="${LAME_DEF_QUAL}"
+    mp3)
+      ((CH[i] == 1)) && mono=(-m m)
+      # Quality: flacs get the default, anything lossy gets a setting that
+      # roughly matches its current bitrate.  Magic numbers divined from
+      # the web pages shown near the top of this file.
+      if [[ ${in_type} == flac ]] || ((br == 0)); then
+        read -ra quality <<<"${LAME_DEF_QUAL}"
+      elif ((br > 283000)); then
+        quality=(-b 320)
+      elif ((br < 98000)); then
+        if ((CH[i] == 1)); then quality=(--abr 56); else quality=(--abr 80); fi
       else
-	# if bitrate is very high use cbr 320
-	if ((${file_data[2]} > 283000))
-	then
-	  quality="-b 320"
-	else
-	  # if bitrate is low use abr 80 or 65
-	  if ((${file_data[2]} < 98000))
-	  then
-	    if [ "${file_data[3]}" -eq 1 ]
-	    then
-	      quality="--abr 56"
-	    else
-	      quality="--abr 80"
-	    fi
-	  else
-	    quality="-V $(echo "scale=5; (${file_data[2]} - 264285.71429) / (-21785.71429 * 1.09)  - 1;" | bc)"
-	  fi
-	fi
+        quality=(-V "$(clamp_number \
+          "$(awk -v b="${br}" 'BEGIN { print (b - 264285.71429) / (-21785.71429 * 1.09) - 1 }')" \
+          0 9.999)")
       fi
-      
-      ${LAME} --quiet ${quality} ${mode} --add-id3v2 \
-	--tt "${file_data[4]}" \
-	--ta "${file_data[5]}" \
-	--tl "${file_data[6]}" \
-	--ty "${file_data[7]}" \
-	--tn "${file_data[8]}" \
-	--tg "${file_data[9]}" \
-	--tc "${file_data[10]}" \
-	"${file_data[@]: -1}" "${file_data[0]}"
-
-      echo Completed encoding $(basename "${file_data[@]: -1}") to mp3
+      cmd=("${LAME}" --quiet "${quality[@]}" "${mono[@]}" --add-id3v2
+           "${tagargs[@]}" "${wav}" "${tmp}")
       ;;
-      
-    "vorbis"|"ogg")
-      echo Encoding $(basename "${file_data[@]: -1}") to ogg ...
-      # Work out quality
-      if [ "${file_data[1]}" == "flac" ]
-      then
-	quality="${OGG_DEF_QUAL}"
+    vorbis)
+      if [[ ${in_type} == flac ]] || ((br == 0)); then
+        read -ra quality <<<"${OGG_DEF_QUAL}"
       else
-	quality="-q $(echo "scale=5; l (${file_data[2]} / 53478.12402) * 1.1384 / 0.18859 - 1;" | bc -l)"
+        # oggenc accepts -1..10; going outside that makes it fail
+        # *after* it has already truncated its output file.
+        quality=(-q "$(clamp_number \
+          "$(awk -v b="${br}" 'BEGIN { print log(b / 53478.12402) * 1.1384 / 0.18859 - 1 }')" \
+          -1 10)")
       fi
-      
-      ${OGGENC} ${quality} --quiet -o "${file_data[0]}" \
-	-t "${file_data[4]}" \
-	-a "${file_data[5]}" \
-	-l "${file_data[6]}" \
-	-d "${file_data[7]}" \
-	-N "${file_data[8]}" \
-	-G "${file_data[9]}" \
-	-c "${file_data[10]}" \
-	"${file_data[@]: -1}" 2>/dev/null
-
-      echo Completed encoding $(basename "${file_data[@]: -1}") to ogg
+      cmd=("${OGGENC}" "${quality[@]}" --quiet -o "${tmp}" "${tagargs[@]}" "${wav}")
       ;;
-      
-    "flac")
-      # what no quality to worry about - ha! this _is_ easy!
-      echo Encoding $(basename "${file_data[@]: -1}") to flac ...
-      ${FLAC} --totally-silent --force --best -o "${file_data[0]}" \
-	--tag TITLE="${file_data[4]}" \
-	--tag ARTIST="${file_data[5]}" \
-	--tag ALBUM="${file_data[6]}" \
-	--tag DATE="${file_data[7]}" \
-	--tag TRACKNUMBER="${file_data[8]}" \
-	--tag GENRE="${file_data[9]}" \
-	--tag COMMENT="${file_data[10]}" \
-	"${file_data[@]: -1}"
-
-      echo Completed encoding $(basename "${file_data[@]: -1}") to flac
+    flac)
+      cmd=("${FLAC}" --silent --force --best -o "${tmp}" "${tagargs[@]}" "${wav}")
       ;;
   esac
-  return $?
-}
 
-process_file () {
-  # Full process route for a single file.
-  # $1 = input file path
-  # $2 = temporary directory path
-  # $3 = user selected target type from command line  
-  # $4 = options to normalize
-  
-  local norm_op
-  echo "Processing file $1 ..."
+  if ! err=$("${cmd[@]}" 2>&1) || [[ ! -s ${tmp} ]]; then
+    warn "Failed to encode ${src} to ${out_type} - original left untouched. ${err}"
+    return 1
+  fi
 
-  # Retrieve file data into file_data
-  eval $(identify_file "${1}")
-  
-  # If file is valid
-  if [ -n "${file_data[1]}" ] &&  echo "mp3 vorbis flac" | grep -q "${file_data[1]}"
-  then
-    # Add target type and wav file name to file data list
-    file_data+=("${3}")
-    file_data+=("$(make_decode_name "${1}" "${2}")")
-    if decode_file "$1" "${file_data[@]: -1}"
-    then
-      echo "Normalizing $1 ..."
-      if norm_op=$(${NORM} --no-progress ${4} "${file_data[@]: -1}" 2>&1)
-      then
-	if ! echo ${norm_op} | grep -q "already normalized"
-	then
-	  encode_file "${file_data[@]}"
-	else
-	  echo $1 is already normalized - not encoding\!
-	fi
-      fi
+  # Keep the original's permissions if we're replacing it
+  if [[ ${dest} == "${src}" ]]; then
+    chmod --reference="${src}" -- "${tmp}" 2>/dev/null
+    mv -f -- "${tmp}" "${dest}" || return 1
+  else
+    printf -v mode '%03o' $((0666 & ~$(umask)))
+    chmod "${mode}" -- "${tmp}"
+    mv -n -- "${tmp}" "${dest}"
+    if [[ -e ${tmp} ]]; then
+      warn "${dest} already exists - not overwriting"
+      return 1
     fi
   fi
+
+  trap - EXIT INT TERM
+  log "Completed encoding ${src##*/} to ${out_type}"
+}
+
+#########################################
+# Normalize a group of files
+#########################################
+process_group () {
+  # Decode, normalize and re-encode a list of files.
+  # $1 = name to use in messages
+  # $2 = 1 to normalize as a batch (a directory), 0 for a single file
+  # remaining args = the files
+  local label=$1 batch=$2
+  shift 2
+
+  local WORK n=0 skipped=0 f j out info t b c dest out_type
+  local -a SRC=() TYPE=() BR=() CH=() WAV=() ok=() wavs=() todo=() nargs=() k_
+  local -A before=()
+
+  WORK=$(mktemp -d "${SESSION}/grp-XXXXXX") || { warn "Cannot create work area"; FAILS=$((FAILS + 1)); return 1; }
+
+  # Identify every file and start decoding the valid ones
+  for f in "$@"; do
+    info=$(probe_file "${f}" "${WORK}/${n}.tags") || continue
+    { read -r t; read -r b; read -r c; } <<<"${info}"
+
+    out_type=$(out_type_for "${t}")
+    if [[ -z $(encoder_for "${out_type}") ]]; then
+      warn "Skipping ${f}: no encoder installed for ${out_type}"
+      FAILS=$((FAILS + 1))
+      ((skipped++))
+      continue
+    fi
+    dest=$(dest_path "${f}" "${t}" "${out_type}")
+    if [[ ${dest} != "${f}" && -e ${dest} ]]; then
+      warn "Skipping ${f}: ${dest} already exists"
+      ((skipped++))
+      continue
+    fi
+
+    SRC[n]=${f}; TYPE[n]=${t}; BR[n]=${b}; CH[n]=${c}
+    WAV[n]=$(printf '%s/%04d.wav' "${WORK}" "${n}")
+    run_job decode_one "${n}"
+    ((n++))
+  done
+  drain
+
+  for ((j = 0; j < n; j++)); do
+    if [[ -e ${WORK}/${j}.ok ]]; then
+      ok+=("${j}")
+      wavs+=("${WAV[j]}")
+    fi
+  done
+  if ((${#ok[@]} == 0)); then
+    ((skipped || (RECURSE && batch))) || warn "No supported audio files found in ${label}"
+    rm -rf -- "${WORK}"
+    return 0
+  fi
+
+  # Build the normalize command line from the options given so far
+  nargs=(--no-progress)
+  [[ -n ${NORM_OPTS[-b]+x} ]] || { ((batch)) && nargs+=(--batch); }
+  for k_ in "${!NORM_OPTS[@]}"; do
+    nargs+=("${k_}")
+    [[ -n ${NORM_OPTS[${k_}]} ]] && nargs+=("${NORM_OPTS[${k_}]}")
+  done
+
+  for j in "${ok[@]}"; do before[${j}]=$(cksum <"${WAV[j]}"); done
+
+  if ((batch)); then
+    log "Batch normalizing ${label} ..."
+  else
+    log "Normalizing ${label} ..."
+  fi
+  if ! out=$("${NORM}" "${nargs[@]}" "${wavs[@]}" 2>&1); then
+    warn "normalize failed for ${label}: ${out}"
+    FAILS=$((FAILS + 1))
+    rm -rf -- "${WORK}"
+    return 1
+  fi
+  if [[ -n ${NORM_OPTS[-v]+x} || -n ${NORM_OPTS[-n]+x} ]]; then
+    printf '%s\n' "${out}"
+  fi
+
+  # Only re-encode what normalize actually changed (re-encoding a lossy
+  # file for nothing just costs quality), plus anything being converted
+  # to a different format.
+  for j in "${ok[@]}"; do
+    out_type=$(out_type_for "${TYPE[j]}")
+    if [[ $(cksum <"${WAV[j]}") != "${before[${j}]}" || ${out_type} != "${TYPE[j]}" ]]; then
+      todo+=("${j}")
+    else
+      log "${SRC[j]} is already normalized - not encoding!"
+    fi
+  done
+
+  for j in "${todo[@]}"; do run_job encode_one "${j}"; done
+  drain
+
+  rm -rf -- "${WORK}"
   return 0
 }
 
 process_dir () {
-  # Full process route for a directory, i.e batch normalize.
-  # We need to decode every file to a wav before we can do
-  # the normalization.
-  # $1 = input file path
-  # $2 = temporary directory path
-  # $3 = user selected target type from command line  
-  # $4 = options to normalize
-  
-  local idx=0 file_list=() p_list=() dec_count norm_op
-  declare -r rows=13
-  echo "Batch processing $1 ..."
-
-  # For each file
-  for ip_file in "${1%/}"/*
-  do
-    # If we get no file expansion break out now
-    [ "${ip_file: -1}" == '*' ] && break
-
-    # Retrieve file data into file_data
-    eval $(identify_file "${ip_file}")
-    
-    # If file is valid
-    if [ -n "${file_data[1]}" ] &&  echo "mp3 vorbis flac" | grep -q "${file_data[1]}"
-    then
-      # Add target type and wav file name to file data list
-      file_data+=("${3}")
-      file_data+=("$(make_decode_name "${ip_file}" "${2}")")
-
-      # If we get a wav file then the append all the data onto
-      # the end of the file list
-      if decode_file "${ip_file}" "${file_data[@]: -1}"
-      then
-	file_list+=("${file_data[@]}")
-      fi
-    fi
+  # $1 = directory
+  local dir=${1%/} f
+  local -a files=()
+  [[ -z ${dir} ]] && dir=/
+  ((RECURSE)) || log "Batch processing ${dir} ..."
+  for f in "${dir%/}"/*; do
+    [[ -f ${f} && -r ${f} ]] && files+=("${f}")
   done
-  # file_list now holds data for all files in one long list
-  # Oh how I wish we had multidimensional arrays!
-  # Each file takes up 13 elements (or rows)
-  
-  # Do we have any wavs?
-  dec_count=$(ls -1 "${2}"/*.wav 2>/dev/null | wc -l)
-  if ((dec_count > 0))
-  then
-    # Yes it's a miracle!
-    echo "Batch normalizing $1 ..."
-    if norm_op=$(${NORM} --batch --no-progress ${4} "${2}"/*.wav 2>&1)
-    then
-      if ! echo ${norm_op} | grep -q "already normalized"
-      then
-	# Slice the file_list every ${rows}, i.e. 1 file = 13 rows
-	while ((idx < ${#file_list[@]}))
-	do
-	  (encode_file "${file_list[@]:${idx}:${rows}}") &
-	  p_list+=($!)
-	  ((idx+=rows))
-	done
-	wait ${p_list[*]}
-      else
-	echo $1 is already normalized - not encoding\!
-      fi
-    fi
+  if ((${#files[@]} == 0)); then
+    ((RECURSE)) || warn "No files in ${dir}"
+    return 0
   fi
-  
-  return 0
+  INNER_PAR=1
+  process_group "${dir}" 1 "${files[@]}"
+  INNER_PAR=0
 }
 
-process_param () {
-  # Process the non-option parameters, i.e. the files and directories
-  # Create the temp working area and decide if were processing a file 
-  # or directory.
-  # $1 = input file path
-  # $2 = temporary directory path
-  # $3 = user selected target type from command line
-  # $4 = options to normalize
-  
-  local WORKDIR=$(mktemp --directory --tmpdir="$2" naud-XXXXXXXXXX)
-  WDIRS[${#WDIRS[@]}]="${WORKDIR}"
-  if [ -d "$1" ]
-  then
-    process_dir "${1}" "${WORKDIR}" "${3}" "${4}"
-  elif [ -f "$1" -a -r "$1" ]
-  then
-    process_file "${1}" "${WORKDIR}" "${3}" "${4}"
-  fi
-  rm -r ${WORKDIR}
-  return 0
-}
+handle_path () {
+  # One file or directory from the command line, using the options
+  # that have been seen up to this point.
+  local p=$1 d
+  local -a dirs=()
+  [[ ${p} == -* ]] && p=./${p}
 
-job_pool_init $((numprocs * 2)) 0
-
-# Command line parameter mangling starts here
-#   -a AMP         \\
-#   -g ADJ          |
-#   -n              |
-#   -T THR          |_ These arguments are passed as arguments to normalize.
-#   -b              |  Run "normalize-audio --help" for more info.
-#   -m              |
-#   -v              |
-#   -q             /
-declare -r NORM_ARG_LIST="-a -g -n -T -b -m -v -q"
-NORM_ARGS=""
-
-while [ -n "$1" ]
-do
-  if [ "${1::1}" == "-" ]
-  then
-    # It's an option
-    if echo "${NORM_ARG_LIST}" | grep -q -e "${1%-}"
-    then
-      # pass-thru arg for normalize
-      case "${1%-}" in
-	-n|-b|-m|-v|-q)
-	  if [ ${1: -1} == "-" ]
-	  then
-	    NORM_ARGS=$(echo ${NORM_ARGS} | sed "s/${1%-}//g")
-	  else
-	    echo ${NORM_ARGS} | grep -q -e ${1%-} || NORM_ARGS="${NORM_ARGS} ${1%-}"
-	  fi
-	  shift
-	  ;;
-	  
-	-a|-g|-T)
-	  if [ ${1: -1} == "-" ]
-	  then
-	    NORM_ARGS=$(echo ${NORM_ARGS} | sed "s/${1%-} \S\+//g")
-	    shift
-	  else
-	    if (($# > 1))
-	    then
-	      if echo ${NORM_ARGS} | grep -q -e ${1%-}
-	      then
-		NORM_ARGS=$(echo ${NORM_ARGS} | sed "s/${1%-} \S\+/${1%-} ${2}/")
-	      else
-		NORM_ARGS="${NORM_ARGS} ${1%-} ${2}"
-	      fi
-	      shift 2
-	    else
-	      echo Missing argument to ${1}
-	      exit 1
-	    fi
-	  fi
-	  ;;
-      esac
-    else  
-      # naud arg
-      case "${1}" in
-	-t)
-	  if (($# > 1))
-	  then
-	    shift
-	    TMPDIR="${1}"
-	  else
-	    echo Missing argument to -t
-	    exit 1
-	  fi
-	  ;;
-	  
-	-o)
-	  if (($# > 1))
-	  then
-	    shift
-	    TARGET="${1}"
-	    if ! echo ${TARGET_OPTS} | grep -q ${TARGET}
-	    then
-	      echo "Unrecognised target file type, should be one of \"${TARGET_OPTS}\""
-	      exit 1
-	    fi
-	  else
-	    echo Missing argument to -o
-	    exit 1
-	  fi
-	  ;;
-      esac
-      shift
+  if [[ -d ${p} ]]; then
+    drain                          # finish any single files first
+    if ((RECURSE)); then
+      while IFS= read -r -d '' d; do
+        dirs+=("${d}")
+      done < <(find "${p}" -type d -print0 | sort -z)
+      for d in "${dirs[@]}"; do process_dir "${d}"; done
+    else
+      process_dir "${p}"
     fi
+  elif [[ -f ${p} && -r ${p} ]]; then
+    throttle
+    (
+      INNER_PAR=0
+      FAILS=0
+      process_group "${p}" 0 "${p}"
+      exit $((FAILS > 0))
+    ) &
   else
-    # It's a file / dir
-    #(process_param "${1}" "${TMPDIR}" "${TARGET}" "${NORM_ARGS}") &
-    job_pool_run process_param "${1}" "${TMPDIR}" "${TARGET}" "${NORM_ARGS}"
-    shift
+    warn "Skipping ${p}: not a readable file or directory"
+    FAILS=$((FAILS + 1))
   fi
+}
+
+#########################################
+# Command line
+#
+# Options affect the files and directories that come after them, so
+#   naud -o mp3 album1 -o ogg album2
+# does what you'd hope.  Options for normalize can be cancelled again
+# by adding a "-" (e.g. "-g-").
+#########################################
+set -- "${args[@]}"
+while (($#)); do
+  case $1 in
+    -t)
+      shift 2                      # already handled by the early scan
+      ;;
+    -o)
+      (($# > 1)) || die "Missing argument to -o"
+      case $2 in
+        same|mp3|flac) TARGET=$2 ;;
+        ogg|vorbis)    TARGET=vorbis ;;
+        *) die "Unrecognised target file type '$2', should be one of: same mp3 ogg vorbis flac" ;;
+      esac
+      shift 2
+      ;;
+    -j)
+      (($# > 1)) || die "Missing argument to -j"
+      [[ $2 =~ ^[1-9][0-9]*$ ]] || die "-j needs a positive number"
+      MAXJOBS=$2
+      shift 2
+      ;;
+    -r)
+      RECURSE=1
+      shift
+      ;;
+    -n|-b|-m|-v|-q)
+      NORM_OPTS[$1]=""
+      shift
+      ;;
+    -n-|-b-|-m-|-v-|-q-)
+      unset "NORM_OPTS[${1%-}]"
+      shift
+      ;;
+    -a|-g|-T)
+      (($# > 1)) || die "Missing argument to $1"
+      NORM_OPTS[$1]=$2
+      shift 2
+      ;;
+    -a-|-g-|-T-)
+      unset "NORM_OPTS[${1%-}]"
+      shift
+      ;;
+    --)
+      shift
+      for p in "$@"; do handle_path "${p}"; done
+      break
+      ;;
+    -?*)
+      die "Unknown option: $1 (try -h)"
+      ;;
+    *)
+      handle_path "$1"
+      shift
+      ;;
+  esac
 done
 
-job_pool_wait
+drain
 
 # Phew! - time for a cup of tea
-echo "naud has finished."
+if ((FAILS > 0)); then
+  log "naud has finished, but some things went wrong - see the messages above."
+  exit 1
+fi
+log "naud has finished."
 exit 0
