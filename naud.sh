@@ -62,6 +62,7 @@ warn () { printf '%s: %s\n' "$PROG" "$*" >&2; }
 die ()  { warn "$*"; exit 1; }
 
 usage () {
+  local norm=$(basename $(command -v normalize-audio || command -v normalize || "normalize (not found)"))
   cat <<EOF
 Usage: $PROG [OPTIONS] FILE|DIR ...
 
@@ -77,7 +78,7 @@ Options apply to the files and directories that follow them:
   -r        recurse into sub-directories, one batch per directory
   -a AMP    \\
   -g ADJ     |
-  -T THR     |  passed to normalize-audio, see "normalize-audio --help".
+  -T THR     |  passed to ${norm}, see ${norm} --help".
   -n -b -m   |  Add a trailing "-" to cancel an earlier one, e.g. "-g-".
   -v -q     /
 
